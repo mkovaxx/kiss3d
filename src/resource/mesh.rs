@@ -4,43 +4,87 @@ use std::sync::{Arc, RwLock};
 
 use crate::resource::gpu_vector::{AllocationType, BufferType, GPUVec};
 use crate::resource::ShaderAttribute;
-use na::{self, Point2, Point3, Vector3};
+use na::{self, Point2, Point3, Scalar, Vector3};
 use ncollide3d::procedural::{IndexBuffer, TriMesh};
 use num::Zero;
+
+use super::GLPrimitive;
 
 #[path = "../error.rs"]
 mod error;
 
+pub type Mesh = MeshG<u16>;
+
+pub trait VertexIndex {
+    fn from_u32(value: u32) -> Self;
+    fn into_u32(self) -> u32;
+    fn into_usize(self) -> usize;
+}
+
+impl VertexIndex for u16 {
+    fn from_u32(value: u32) -> Self {
+        value as u16
+    }
+
+    fn into_u32(self) -> u32 {
+        self as u32
+    }
+
+    fn into_usize(self) -> usize {
+        self as usize
+    }
+}
+
+impl VertexIndex for u32 {
+    fn from_u32(value: u32) -> Self {
+        value
+    }
+
+    fn into_u32(self) -> u32 {
+        self
+    }
+
+    fn into_usize(self) -> usize {
+        self as usize
+    }
+}
+
 /// Aggregation of vertices, indices, normals and texture coordinates.
 ///
 /// It also contains the GPU location of those buffers.
-pub struct Mesh {
+pub struct MeshG<VertIdx: Copy + Scalar + VertexIndex> {
     coords: Arc<RwLock<GPUVec<Point3<f32>>>>,
-    faces: Arc<RwLock<GPUVec<Point3<u16>>>>,
+    faces: Arc<RwLock<GPUVec<Point3<VertIdx>>>>,
     normals: Arc<RwLock<GPUVec<Vector3<f32>>>>,
     uvs: Arc<RwLock<GPUVec<Point2<f32>>>>,
-    edges: Option<Arc<RwLock<GPUVec<Point2<u16>>>>>,
+    edges: Option<Arc<RwLock<GPUVec<Point2<VertIdx>>>>>,
 }
 
-impl Mesh {
+impl<VertIdx: Copy + Scalar + VertexIndex> MeshG<VertIdx>
+where
+    Point2<VertIdx>: GLPrimitive,
+    Point3<VertIdx>: GLPrimitive,
+{
     /// Creates a new mesh.
     ///
     /// If the normals and uvs are not given, they are automatically computed.
     pub fn new(
         coords: Vec<Point3<f32>>,
-        faces: Vec<Point3<u16>>,
+        faces: Vec<Point3<VertIdx>>,
         normals: Option<Vec<Vector3<f32>>>,
         uvs: Option<Vec<Point2<f32>>>,
         dynamic_draw: bool,
-    ) -> Mesh {
+    ) -> Self {
         let normals = match normals {
             Some(ns) => ns,
-            None => Mesh::compute_normals_array(&coords[..], &faces[..]),
+            None => MeshG::compute_normals_array(&coords[..], &faces[..]),
         };
 
         let uvs = match uvs {
             Some(us) => us,
-            None => iter::repeat(Point2::origin()).take(coords.len()).collect(),
+            None => iter::repeat(Point2::<f32>::origin())
+                .take(coords.len())
+                .collect(),
         };
 
         let location = if dynamic_draw {
@@ -65,13 +109,13 @@ impl Mesh {
         )));
         let us = Arc::new(RwLock::new(GPUVec::new(uvs, BufferType::Array, location)));
 
-        Mesh::new_with_gpu_vectors(cs, fs, ns, us)
+        MeshG::new_with_gpu_vectors(cs, fs, ns, us)
     }
 
     /// Creates a new mesh from a mesh descr.
     ///
     /// In the normals and uvs are not given, they are automatically computed.
-    pub fn from_trimesh(mesh: TriMesh<f32>, dynamic_draw: bool) -> Mesh {
+    pub fn from_trimesh(mesh: TriMesh<f32>, dynamic_draw: bool) -> Self {
         let mut mesh = mesh;
 
         mesh.unify_index_buffer();
@@ -83,12 +127,18 @@ impl Mesh {
             indices,
         } = mesh;
 
-        Mesh::new(
+        MeshG::new(
             coords,
             indices
                 .unwrap_unified()
                 .into_iter()
-                .map(na::convert)
+                .map(|i| {
+                    Point3::new(
+                        VertIdx::from_u32(i.x),
+                        VertIdx::from_u32(i.y),
+                        VertIdx::from_u32(i.z),
+                    )
+                })
                 .collect(),
             normals,
             uvs,
@@ -122,7 +172,7 @@ impl Mesh {
                 faces
                     .unwrap()
                     .into_iter()
-                    .map(|e| Point3::new(e.x as u32, e.y as u32, e.z as u32))
+                    .map(|e| Point3::new(e.x.into_u32(), e.y.into_u32(), e.z.into_u32()))
                     .collect(),
             )),
         ))
@@ -177,11 +227,11 @@ impl Mesh {
     /// Creates a new mesh. Arguments set to `None` are automatically computed.
     pub fn new_with_gpu_vectors(
         coords: Arc<RwLock<GPUVec<Point3<f32>>>>,
-        faces: Arc<RwLock<GPUVec<Point3<u16>>>>,
+        faces: Arc<RwLock<GPUVec<Point3<VertIdx>>>>,
         normals: Arc<RwLock<GPUVec<Vector3<f32>>>>,
         uvs: Arc<RwLock<GPUVec<Point2<f32>>>>,
-    ) -> Mesh {
-        Mesh {
+    ) -> Self {
+        MeshG {
             coords,
             faces,
             normals,
@@ -255,7 +305,7 @@ impl Mesh {
 
     /// Recompute this mesh normals.
     pub fn recompute_normals(&mut self) {
-        Mesh::compute_normals(
+        MeshG::compute_normals(
             &self.coords.read().unwrap().data().as_ref().unwrap()[..],
             &self.faces.read().unwrap().data().as_ref().unwrap()[..],
             self.normals.write().unwrap().data_mut().as_mut().unwrap(),
@@ -263,7 +313,7 @@ impl Mesh {
     }
 
     /// This mesh faces.
-    pub fn faces(&self) -> &Arc<RwLock<GPUVec<Point3<u16>>>> {
+    pub fn faces(&self) -> &Arc<RwLock<GPUVec<Point3<VertIdx>>>> {
         &self.faces
     }
 
@@ -285,11 +335,11 @@ impl Mesh {
     /// Computes normals from a set of faces.
     pub fn compute_normals_array(
         coordinates: &[Point3<f32>],
-        faces: &[Point3<u16>],
+        faces: &[Point3<VertIdx>],
     ) -> Vec<Vector3<f32>> {
         let mut res = Vec::new();
 
-        Mesh::compute_normals(coordinates, faces, &mut res);
+        MeshG::compute_normals(coordinates, faces, &mut res);
 
         res
     }
@@ -297,7 +347,7 @@ impl Mesh {
     /// Computes normals from a set of faces.
     pub fn compute_normals(
         coordinates: &[Point3<f32>],
-        faces: &[Point3<u16>],
+        faces: &[Point3<VertIdx>],
         normals: &mut Vec<Vector3<f32>>,
     ) {
         let mut divisor: Vec<f32> = iter::repeat(0f32).take(coordinates.len()).collect();
@@ -307,8 +357,8 @@ impl Mesh {
 
         // Accumulate normals ...
         for f in faces.iter() {
-            let edge1 = coordinates[f.y as usize] - coordinates[f.x as usize];
-            let edge2 = coordinates[f.z as usize] - coordinates[f.x as usize];
+            let edge1 = coordinates[f.y.into_usize()] - coordinates[f.x.into_usize()];
+            let edge2 = coordinates[f.z.into_usize()] - coordinates[f.x.into_usize()];
             let cross = edge1.cross(&edge2);
             let normal;
 
@@ -318,13 +368,13 @@ impl Mesh {
                 normal = cross
             }
 
-            normals[f.x as usize] += normal;
-            normals[f.y as usize] += normal;
-            normals[f.z as usize] += normal;
+            normals[f.x.into_usize()] += normal;
+            normals[f.y.into_usize()] += normal;
+            normals[f.z.into_usize()] += normal;
 
-            divisor[f.x as usize] += 1.0;
-            divisor[f.y as usize] += 1.0;
-            divisor[f.z as usize] += 1.0;
+            divisor[f.x.into_usize()] += 1.0;
+            divisor[f.y.into_usize()] += 1.0;
+            divisor[f.z.into_usize()] += 1.0;
         }
 
         // ... and compute the mean
